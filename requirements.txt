@@ -1,0 +1,15 @@
+# requirements.txt — Dependencias del proyecto
+# Instalar con: pip install -r requirements.txt
+
+# HTTP asíncrono (cliente para asyncio)
+aiohttp>=3.9.0
+
+# Procesamiento de datos
+pandas>=2.1.0
+numpy>=1.26.0
+
+# MPI para Python
+mpi4py>=3.1.5
+
+# (Opcional) Para pruebas sin GPU — tu compañero usará cupy-cuda12x
+# cupy-cuda12x>=13.0.0
