@@ -35,6 +35,23 @@ Resultado esperado:
 - En una computadora sin NVIDIA: `Backend : cpu_fallback`.
 - En una computadora con NVIDIA/CUDA funcionando: `Backend : cuda`.
 
+Si en Windows aparece `Failure finding "nvrtc*.dll"`, significa que CuPy no
+encuentra NVRTC, la libreria de compilacion runtime de CUDA. Soluciones:
+
+```powershell
+pip install -U "cupy-cuda12x[ctk]"
+```
+
+o agrega el binario de CUDA al entorno antes de ejecutar:
+
+```powershell
+$env:CUDA_PATH="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+$env:PATH="$env:CUDA_PATH\bin;$env:PATH"
+python main.py 4
+```
+
+La carpeta exacta puede variar (`v12.4`, `v12.5`, `v12.6`, etc.).
+
 ## API key de OpenWeather
 
 El proyecto puede correr solo con ThingSpeak. Para incluir OpenWeather, usa una

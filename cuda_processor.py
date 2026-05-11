@@ -4,6 +4,8 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
+import platform
 import time
 import warnings
 from datetime import datetime, timezone
@@ -65,6 +67,56 @@ FEATURES = [
 ]
 
 RISK_WEIGHTS = np.array([0.22, 0.16, 0.14, 0.22, 0.18, 0.08], dtype=np.float32)
+_DLL_DIRECTORY_HANDLES = []
+
+
+def _configure_windows_cuda_dll_paths() -> list[str]:
+    """
+    En Windows, CuPy necesita encontrar DLLs como nvrtc64_*.dll.
+
+    A veces CUDA esta instalado, pero su carpeta bin no esta en PATH/CUDA_PATH.
+    Esta funcion agrega rutas comunes al buscador de DLLs de Python antes de
+    importar CuPy.
+    """
+    if platform.system() != "Windows":
+        return []
+
+    candidates: list[Path] = []
+    cuda_path = os.getenv("CUDA_PATH")
+    if cuda_path:
+        candidates.append(Path(cuda_path) / "bin")
+
+    cuda_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if cuda_root.exists():
+        candidates.extend(sorted(cuda_root.glob(r"v12*\bin"), reverse=True))
+        candidates.extend(sorted(cuda_root.glob(r"v13*\bin"), reverse=True))
+
+    added = []
+    current_path = os.environ.get("PATH", "")
+    path_parts = current_path.split(os.pathsep) if current_path else []
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+
+        has_nvrtc = any(candidate.glob("nvrtc*.dll"))
+        if not has_nvrtc:
+            continue
+
+        candidate_str = str(candidate)
+        if candidate_str not in path_parts:
+            os.environ["PATH"] = candidate_str + os.pathsep + os.environ.get("PATH", "")
+
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            try:
+                _DLL_DIRECTORY_HANDLES.append(add_dll_directory(candidate_str))
+            except OSError:
+                pass
+
+        added.append(candidate_str)
+
+    return added
 
 
 def _latest_processed_report(prefix: str) -> str:
@@ -167,6 +219,10 @@ def _run_cpu(matrix: np.ndarray, reason: str) -> dict:
 
 def _run_cuda(matrix: np.ndarray) -> dict:
     try:
+        added_paths = _configure_windows_cuda_dll_paths()
+        if added_paths:
+            logger.info("Rutas CUDA agregadas para DLLs: %s", added_paths)
+
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -178,7 +234,7 @@ def _run_cuda(matrix: np.ndarray) -> dict:
         if cp.cuda.runtime.getDeviceCount() == 0:
             return _run_cpu(matrix, "CuPy instalado, pero no hay GPU CUDA disponible.")
     except Exception as exc:
-        return _run_cpu(matrix, f"CUDA/CuPy no disponible: {exc}")
+        return _run_cpu(matrix, _cuda_error_hint(exc))
 
     try:
         props = cp.cuda.runtime.getDeviceProperties(0)
@@ -251,7 +307,23 @@ def _run_cuda(matrix: np.ndarray) -> dict:
         }
     except Exception as exc:
         logger.warning("CUDA fallo durante la ejecucion; se usa fallback CPU: %s", exc)
-        return _run_cpu(matrix, f"CUDA fallo durante la ejecucion: {exc}")
+        return _run_cpu(matrix, _cuda_error_hint(exc, during_execution=True))
+
+
+def _cuda_error_hint(exc: Exception, during_execution: bool = False) -> str:
+    message = str(exc)
+    prefix = "CUDA fallo durante la ejecucion" if during_execution else "CUDA/CuPy no disponible"
+
+    if "nvrtc" in message.lower() and "dll" in message.lower():
+        return (
+            f"{prefix}: {message}. Falta NVRTC en el PATH de Windows. "
+            "Solucion recomendada: instala/actualiza con "
+            "pip install -U \"cupy-cuda12x[ctk]\" o agrega "
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.x\\bin "
+            "a CUDA_PATH/PATH."
+        )
+
+    return f"{prefix}: {message}"
 
 
 def _round_list(values: np.ndarray, digits: int = 4) -> list[float]:

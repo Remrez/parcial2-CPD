@@ -1,3 +1,8 @@
 # Dependencia opcional para ejecutar la fase CUDA en una GPU NVIDIA con CUDA 12.
-# Si tu instalacion usa CUDA 11, reemplaza por cupy-cuda11x.
-cupy-cuda12x>=13.0.0
+#
+# El extra [ctk] instala los componentes CUDA de NVIDIA via pip, incluyendo
+# NVRTC. Esto evita errores en Windows como:
+#   Failure finding "nvrtc*.dll": No such file: nvrtc*.dll
+#
+# Si tu equipo usa CUDA 13, cambia cupy-cuda12x por cupy-cuda13x.
+cupy-cuda12x[ctk]>=14.0.0
