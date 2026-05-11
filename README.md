@@ -50,7 +50,17 @@ Opcion B: archivo local `keys.py` ignorado por git
 
 ```python
 openweather_api = "TU_API_KEY"
+thingspeak_api = "TU_THINGSPEAK_READ_API_KEY"
+thingspeak_channelID = 123456
 ```
+
+El codigo tambien acepta variables de entorno (`OPENWEATHER_API_KEY`,
+`THINGSPEAK_READ_KEY`, `THINGSPEAK_CHANNEL_ID`), pero para este proyecto el
+formato anterior de `keys.py` sigue funcionando.
+
+Nota: `thingspeak_api` debe ser una **Read API Key**. Si el canal no tiene
+lecturas o la key no permite leer datos, el programa lo avisara y usara el canal
+publico `12397` como respaldo para que el pipeline completo pueda ejecutarse.
 
 ## Ejecucion completa
 

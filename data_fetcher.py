@@ -1,5 +1,4 @@
 import asyncio
-import aiohttp
 import json
 import logging
 import os
@@ -7,14 +6,15 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import aiohttp
 import pandas as pd
 
 import config
 
-# ── Configuración del logger ───────────────────────────────────────────────────
+
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
@@ -22,17 +22,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DataFetcher")
 
-class APIClient:
-    """
-    Cliente HTTP asíncrono reutilizable.
 
-    Parámetros
-    ----------
-    timeout : int
-        Segundos máximos de espera por solicitud.
-    max_retries : int
-        Cuántas veces reintentar si falla la solicitud.
-    """
+class APIClient:
+    """Cliente HTTP asincrono con timeout, limite de conexiones y reintentos."""
 
     def __init__(
         self,
@@ -43,11 +35,7 @@ class APIClient:
         self.max_retries = max_retries
         self._session: Optional[aiohttp.ClientSession] = None
 
-    # Usamos "async with APIClient() as client:" para garantizar que la sesión
-    # HTTP siempre se cierre aunque ocurra una excepción.
-
     async def __aenter__(self):
-        # TCPConnector limita conexiones simultáneas al mismo host
         connector = aiohttp.TCPConnector(
             limit_per_host=config.MAX_CONNECTIONS_PER_HOST
         )
@@ -61,102 +49,142 @@ class APIClient:
         if self._session:
             await self._session.close()
 
-    # ── Método base de petición con reintentos ───────────────────────────────
-
-    async def get(self, url: str, params: dict = None, label: str = "") -> Any:
-        """
-        Realiza una petición GET asíncrona con reintentos exponenciales.
-
-        Retorna el JSON parseado o None si todos los reintentos fallan.
-        """
+    async def get(self, url: str, params: dict | None = None, label: str = "") -> Any:
+        """Realiza una peticion GET asincrona con reintentos exponenciales."""
         for attempt in range(1, self.max_retries + 1):
             try:
-                logger.info(f"[{label}] GET {url} (intento {attempt})")
+                logger.info("[%s] GET %s (intento %s)", label, url, attempt)
                 async with self._session.get(url, params=params) as resp:
-                    resp.raise_for_status()           # lanza excepción si status ≥ 400
+                    resp.raise_for_status()
                     data = await resp.json()
-                    logger.info(f"[{label}] ✓ Respuesta recibida (status {resp.status})")
+                    logger.info("[%s] Respuesta recibida (status %s)", label, resp.status)
                     return data
 
-            except aiohttp.ClientResponseError as e:
-                logger.warning(f"[{label}] Error HTTP {e.status}: {e.message}")
-            except aiohttp.ClientConnectionError as e:
-                logger.warning(f"[{label}] Error de conexión: {e}")
+            except aiohttp.ClientResponseError as exc:
+                logger.warning("[%s] Error HTTP %s: %s", label, exc.status, exc.message)
+            except aiohttp.ClientConnectionError as exc:
+                logger.warning("[%s] Error de conexion: %s", label, exc)
             except asyncio.TimeoutError:
-                logger.warning(f"[{label}] Timeout en intento {attempt}")
-            except Exception as e:
-                logger.error(f"[{label}] Error inesperado: {e}")
+                logger.warning("[%s] Timeout en intento %s", label, attempt)
+            except Exception as exc:
+                logger.error("[%s] Error inesperado: %s", label, exc)
 
             if attempt < self.max_retries:
-                # Backoff exponencial: 2s, 4s, 8s, ...
                 wait = config.RETRY_DELAY * (2 ** (attempt - 1))
-                logger.info(f"[{label}] Reintentando en {wait}s...")
+                logger.info("[%s] Reintentando en %ss...", label, wait)
                 await asyncio.sleep(wait)
 
-        logger.error(f"[{label}] Todos los intentos fallaron.")
+        logger.error("[%s] Todos los intentos fallaron.", label)
         return None
 
 
-# Cada función es una corrutina (async def) que usa el cliente compartido.
-# Reciben el cliente como parámetro para reusar la misma sesión HTTP.
+def _thingspeak_dataframe(raw: dict, label: str) -> pd.DataFrame:
+    feeds = raw.get("feeds") or []
+    channel = raw.get("channel") or {}
 
-#THINGSPEAK
+    if not feeds:
+        fields = {
+            key: value
+            for key, value in channel.items()
+            if key.startswith("field") and value
+        }
+        logger.warning(
+            "[%s] La API respondio, pero no devolvio lecturas. feeds=0, campos=%s",
+            label,
+            fields or "sin campos publicados",
+        )
+        return pd.DataFrame()
 
-async def fetch_thingspeak(client: APIClient) -> Optional[pd.DataFrame]:
-    """
-    Obtiene las últimas N lecturas de un canal ThingSpeak.
-
-    ThingSpeak estructura su respuesta como:
-    {
-      "channel": { ...metadata... },
-      "feeds": [ {"created_at": "...", "field1": "...", ...}, ... ]
-    }
-
-    Es la fuente de datos principal del proyecto: provee temperatura,
-    humedad, presión, PM2.5, PM10, nivel de luz y datos de viento.
-    """
-    url = (
-        f"{config.THINGSPEAK_BASE_URL}"
-        f"/channels/{config.THINGSPEAK_CHANNEL_ID}/feeds.json"
-    )
-    params = {"results": config.THINGSPEAK_NUM_RESULTS}
-    if config.THINGSPEAK_READ_KEY:
-        params["api_key"] = config.THINGSPEAK_READ_KEY
-
-    raw = await client.get(url, params=params, label="ThingSpeak")
-    if not raw or "feeds" not in raw:
-        return None
-
-    feeds = raw["feeds"]
     df = pd.DataFrame(feeds)
+    if "created_at" not in df.columns:
+        logger.warning(
+            "[%s] La respuesta no contiene columna created_at. Columnas: %s",
+            label,
+            list(df.columns),
+        )
+        return pd.DataFrame()
 
-    # Renombrar columnas genéricas (field1, field2…) a nombres descriptivos
     df.rename(columns=config.THINGSPEAK_FIELD_NAMES, inplace=True)
-
-    # Convertir timestamp a datetime y campos numéricos
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+
     for col in df.columns:
         if col != "created_at":
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df.sort_values("created_at", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    logger.info(f"[ThingSpeak] {len(df)} registros cargados.")
     return df
 
 
-#OPENWEATHER
+async def _fetch_thingspeak_channel(
+    client: APIClient,
+    channel_id: int,
+    read_key: str = "",
+    label: str = "ThingSpeak",
+) -> pd.DataFrame:
+    url = f"{config.THINGSPEAK_BASE_URL}/channels/{channel_id}/feeds.json"
+    params = {"results": config.THINGSPEAK_NUM_RESULTS}
+    if read_key:
+        params["api_key"] = read_key
+
+    raw = await client.get(url, params=params, label=label)
+    if not raw or "feeds" not in raw:
+        logger.warning("[%s] Respuesta vacia o sin arreglo feeds.", label)
+        return pd.DataFrame()
+
+    return _thingspeak_dataframe(raw, label)
+
+
+async def fetch_thingspeak(client: APIClient) -> Optional[pd.DataFrame]:
+    """
+    Obtiene las ultimas lecturas de ThingSpeak.
+
+    Primero intenta usar el canal/key de keys.py. Si ese canal no devuelve
+    lecturas, usa un canal publico de respaldo para que el pipeline siga siendo
+    ejecutable y deje un diagnostico claro.
+    """
+    df = await _fetch_thingspeak_channel(
+        client,
+        config.THINGSPEAK_CHANNEL_ID,
+        config.THINGSPEAK_READ_KEY,
+        label=f"ThingSpeak:{config.THINGSPEAK_CHANNEL_ID}",
+    )
+
+    if not df.empty:
+        logger.info("[ThingSpeak] %s registros cargados.", len(df))
+        return df
+
+    fallback_id = config.THINGSPEAK_FALLBACK_CHANNEL_ID
+    if (
+        config.THINGSPEAK_ALLOW_PUBLIC_FALLBACK
+        and fallback_id
+        and fallback_id != config.THINGSPEAK_CHANNEL_ID
+    ):
+        logger.warning(
+            "[ThingSpeak] El canal configurado no tiene lecturas disponibles. "
+            "Se usara el canal publico de respaldo %s para completar el pipeline. "
+            "Para usar tu canal, revisa que tenga datos y que thingspeak_api sea "
+            "una Read API Key valida.",
+            fallback_id,
+        )
+        df = await _fetch_thingspeak_channel(
+            client,
+            fallback_id,
+            "",
+            label=f"ThingSpeak:fallback:{fallback_id}",
+        )
+        if not df.empty:
+            logger.info("[ThingSpeak] %s registros cargados desde fallback.", len(df))
+            return df
+
+    raise RuntimeError(
+        "ThingSpeak no devolvio lecturas. Revisa thingspeak_channelID, "
+        "thingspeak_api (debe ser Read API Key) y que el canal tenga entradas."
+    )
+
 
 async def fetch_openweather(client: APIClient) -> Optional[dict]:
-    """
-    Obtiene condiciones meteorológicas actuales.
-
-    Retorna un dict con temperatura, humedad, presión, descripción del clima,
-    velocidad del viento, visibilidad, etc.
-
-    Estos datos se cruzan con los sensores de ThingSpeak para validar lecturas
-    y con OpenAQ para enriquecer el análisis ambiental.
-    """
+    """Obtiene condiciones meteorologicas actuales desde OpenWeather."""
     if not config.OPENWEATHER_API_KEY:
         logger.warning(
             "[OpenWeather] Sin API key. Define OPENWEATHER_API_KEY o crea keys.py; "
@@ -166,124 +194,98 @@ async def fetch_openweather(client: APIClient) -> Optional[dict]:
 
     url = f"{config.OPENWEATHER_BASE_URL}/weather"
     params = {
-        "q":     config.OPENWEATHER_CITY,
+        "q": config.OPENWEATHER_CITY,
         "appid": config.OPENWEATHER_API_KEY,
         "units": config.OPENWEATHER_UNITS,
-        "lang":  "es",
+        "lang": "es",
     }
     raw = await client.get(url, params=params, label="OpenWeather")
     if not raw:
         return None
 
-    # Aplanamos la respuesta anidada en un dict plano fácil de usar
     weather = {
-        "ciudad":             raw.get("name"),
-        "temperatura":        raw.get("main", {}).get("temp"),
-        "sensacion_termica":  raw.get("main", {}).get("feels_like"),
-        "humedad":            raw.get("main", {}).get("humidity"),
-        "presion":            raw.get("main", {}).get("pressure"),
-        "visibilidad":        raw.get("visibility"),          # metros
-        "descripcion":        raw.get("weather", [{}])[0].get("description"),
-        "velocidad_viento":   raw.get("wind", {}).get("speed"),
-        "direccion_viento":   raw.get("wind", {}).get("deg"),
-        "nubosidad":          raw.get("clouds", {}).get("all"),  # %
-        "timestamp":          datetime.fromtimestamp(raw.get("dt", 0), timezone.utc),
+        "ciudad": raw.get("name"),
+        "temperatura": raw.get("main", {}).get("temp"),
+        "sensacion_termica": raw.get("main", {}).get("feels_like"),
+        "humedad": raw.get("main", {}).get("humidity"),
+        "presion": raw.get("main", {}).get("pressure"),
+        "visibilidad": raw.get("visibility"),
+        "descripcion": raw.get("weather", [{}])[0].get("description"),
+        "velocidad_viento": raw.get("wind", {}).get("speed"),
+        "direccion_viento": raw.get("wind", {}).get("deg"),
+        "nubosidad": raw.get("clouds", {}).get("all"),
+        "timestamp": datetime.fromtimestamp(raw.get("dt", 0), timezone.utc),
     }
     logger.info(
-        f"[OpenWeather] Clima obtenido: "
-        f"{weather['descripcion']}, {weather['temperatura']}°C"
+        "[OpenWeather] Clima obtenido: %s, %s C",
+        weather["descripcion"],
+        weather["temperatura"],
     )
     return weather
 
-# Esta es la función que el resto del pipeline llama.
-# Lanza TODAS las fuentes al mismo tiempo con asyncio.gather.
 
 async def fetch_all_sources() -> dict[str, Any]:
-    """
-    Ejecuta todas las peticiones de forma concurrente.
-
-    Retorna un diccionario con los DataFrames/dicts de cada fuente:
-    {
-        "thingspeak":  DataFrame,   ← datos de sensores (fuente principal)
-        "weather":     dict,        ← condiciones meteorológicas actuales
-        "timestamp":   str,
-    }
-    """
+    """Ejecuta todas las peticiones de forma concurrente y guarda datos crudos."""
     start = time.perf_counter()
-    logger.info("═" * 60)
+    logger.info("=" * 60)
     logger.info("Iniciando fetching concurrente de todas las fuentes...")
 
     async with APIClient() as client:
-        # asyncio.gather lanza todas las corrutinas simultáneamente.
-        # Cada una puede estar esperando su respuesta HTTP al mismo tiempo,
-        # sin que ninguna bloquee a las demás.
-        (
-            df_thingspeak,
-            weather,
-        ) = await asyncio.gather(
+        df_thingspeak, weather = await asyncio.gather(
             fetch_thingspeak(client),
             fetch_openweather(client),
         )
 
     elapsed = time.perf_counter() - start
-    logger.info(f"Fetching completado en {elapsed:.2f}s")
-    logger.info("═" * 60)
+    logger.info("Fetching completado en %.2fs", elapsed)
+    logger.info("=" * 60)
 
     results = {
-        "thingspeak":  df_thingspeak,
-        "weather":     weather,
-        "timestamp":   datetime.now(timezone.utc).isoformat(),
+        "thingspeak": df_thingspeak,
+        "weather": weather,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Guardar datos crudos en CSV/JSON para que MPI los lea desde disco
     _save_raw(results)
-
     return results
 
-# Los procesos MPI no comparten memoria con el proceso Asyncio, así que
-# guardamos los datos en archivos JSON/CSV que MPI leerá después.
 
 def _save_raw(data: dict) -> None:
-    """Guarda cada fuente en un archivo CSV/JSON dentro de datos_crudos/."""
+    """Guarda cada fuente en datos_crudos/ para que MPI la lea desde disco."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     for key, value in data.items():
         if key == "timestamp":
             continue
+
         path_base = os.path.join(config.RAW_DATA_DIR, f"{key}_{ts}")
 
         if isinstance(value, pd.DataFrame) and not value.empty:
             csv_path = path_base + ".csv"
             value.to_csv(csv_path, index=False)
-            logger.info(f"[Save] {key} → {csv_path}")
+            logger.info("[Save] %s -> %s", key, csv_path)
 
         elif isinstance(value, dict):
             json_path = path_base + ".json"
-            with open(json_path, "w", encoding="utf-8") as f:
+            with open(json_path, "w", encoding="utf-8") as file:
                 clean = {
-                    k: str(v) if isinstance(v, datetime) else v
+                    k: v.isoformat() if isinstance(v, datetime) else v
                     for k, v in value.items()
                 }
-                json.dump(clean, f, ensure_ascii=False, indent=2)
-            logger.info(f"[Save] {key} → {json_path}")
+                json.dump(clean, file, ensure_ascii=False, indent=2)
+            logger.info("[Save] %s -> %s", key, json_path)
 
         else:
-            logger.warning(f"[Save] {key}: sin datos o formato no reconocido.")
+            logger.warning("[Save] %s: sin datos o formato no reconocido.", key)
 
-
-# PUNTO DE ENTRADA DIRECTO (para pruebas del módulo)
 
 if __name__ == "__main__":
-    # asyncio.run() crea el event loop, ejecuta la corrutina y lo cierra al final
     results = asyncio.run(fetch_all_sources())
 
-    print("\n── Resumen de datos obtenidos ──────────────────────────────")
+    print("\n--- Resumen de datos obtenidos ---")
     for key, val in results.items():
         if isinstance(val, pd.DataFrame):
-            print(
-                f"  {key:15s}: DataFrame con {len(val)} filas "
-                f"y {len(val.columns)} columnas"
-            )
+            print(f"  {key:15s}: DataFrame con {len(val)} filas y {len(val.columns)} columnas")
         elif isinstance(val, dict):
             print(f"  {key:15s}: dict con {len(val)} campos")
         else:
