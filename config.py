@@ -1,6 +1,14 @@
-import keys
+import os
 
-OPENWEATHER_API_KEY = keys.openweather_api  
+try:
+    import keys
+except ImportError:
+    keys = None
+
+OPENWEATHER_API_KEY = (
+    os.getenv("OPENWEATHER_API_KEY")
+    or getattr(keys, "openweather_api", "")
+)
 
 THINGSPEAK_CHANNEL_ID  = 12397               
 THINGSPEAK_READ_KEY    = ""                     
@@ -39,14 +47,15 @@ RETRY_DELAY = 2
 MAX_RETRIES = 3
 
 # ── Rutas de archivos de salida ────────────────────────────────────────────────
-import os
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 RAW_DATA_DIR   = os.path.join(BASE_DIR, "datos_crudos")
 PROCESSED_DIR  = os.path.join(BASE_DIR, "datos_procesados")
+REPORTS_DIR    = os.path.join(BASE_DIR, "reportes")
 
 # Crear directorios si no existen
 os.makedirs(RAW_DATA_DIR,  exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
+os.makedirs(REPORTS_DIR,   exist_ok=True)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"   # DEBUG, INFO, WARNING, ERROR

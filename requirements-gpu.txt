@@ -1,0 +1,3 @@
+# Dependencia opcional para ejecutar la fase CUDA en una GPU NVIDIA con CUDA 12.
+# Si tu instalacion usa CUDA 11, reemplaza por cupy-cuda11x.
+cupy-cuda12x>=13.0.0

@@ -1,140 +1,177 @@
-import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
 import asyncio
-import subprocess
+import io
 import logging
 import os
+import subprocess
+import sys
 import time
 
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
 import config
+from cuda_processor import run_cuda_analysis
 from data_fetcher import fetch_all_sources
+from report_generator import generate_html_report
+
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
-    format="%(asctime)s [MAIN] %(levelname)s: %(message)s",
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
     ],
+    force=True,
 )
 logger = logging.getLogger("Main")
 
 
 def fase_1_fetch() -> dict:
     """
-    Fase 1: Lectura concurrente de todas las APIs con Asyncio.
+    Fase 1: lectura concurrente de las APIs con Asyncio.
 
-    Llama a fetch_all_sources() que internamente usa asyncio.gather
-    para lanzar todas las peticiones HTTP simultáneamente.
+    fetch_all_sources() usa asyncio.gather para lanzar las peticiones HTTP al
+    mismo tiempo y guardar los datos crudos en disco para que MPI pueda leerlos.
     """
-    logger.info("▶ FASE 1: Iniciando fetching concurrente...")
+    logger.info("> FASE 1: Iniciando fetching concurrente...")
     t0 = time.perf_counter()
 
-    # asyncio.run() es el punto de entrada al mundo asíncrono.
-    # Crea el event loop, ejecuta la corrutina hasta completarse y lo cierra.
     resultados = asyncio.run(fetch_all_sources())
 
     elapsed = time.perf_counter() - t0
-    logger.info(f"✓ FASE 1 completada en {elapsed:.2f}s")
+    logger.info("OK FASE 1 completada en %.2fs", elapsed)
 
-    # Resumen rápido de lo obtenido
     for key, val in resultados.items():
-        if hasattr(val, "__len__") and key != "timestamp":
-            logger.info(f"  {key}: {len(val)} registros")
+        if hasattr(val, "__len__") and key != "timestamp" and val is not None:
+            logger.info("  %s: %s registros", key, len(val))
 
     return resultados
 
 
 def fase_2_mpi(n_procesos: int = 4) -> bool:
     """
-    Fase 2: Procesamiento distribuido con MPI4Py.
+    Fase 2: procesamiento distribuido con MPI4Py.
 
-    Lanza mpiexec con N procesos. Cada proceso corre mpi_processor.py,
-    lee su porción de datos desde disco y ejecuta los análisis en paralelo.
-
-    Parámetros
-    ----------
-    n_procesos : int
-        Número de procesos MPI a lanzar. Recomendado: igual al número
-        de núcleos físicos de tu CPU (o menos).
+    Lanza mpiexec con N procesos. Cada proceso corre mpi_processor.py, recibe
+    una parte del dataset, calcula estadisticas locales y el rank 0 agrega el
+    reporte final en datos_procesados/reporte_mpi_*.json.
     """
-    logger.info(f"▶ FASE 2: Iniciando procesamiento MPI con {n_procesos} procesos...")
+    logger.info("> FASE 2: Iniciando MPI con %s procesos...", n_procesos)
     t0 = time.perf_counter()
 
-    # Construir el comando mpiexec
-    # -n N : número de procesos
-    # sys.executable : usa el mismo Python del entorno virtual actual
     cmd = [
         "mpiexec",
-        "-n", str(n_procesos),
-        sys.executable,           # python / python3 del entorno actual
+        "-n",
+        str(n_procesos),
+        sys.executable,
         os.path.join(os.path.dirname(__file__), "mpi_processor.py"),
     ]
 
-    logger.info(f"Comando: {' '.join(cmd)}")
+    logger.info("Comando: %s", " ".join(cmd))
 
     try:
-        # subprocess.run bloquea hasta que mpiexec termine.
-        # check=True lanza CalledProcessError si el proceso falla.
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=False,   # mostrar output en consola directamente
-        )
+        result = subprocess.run(cmd, check=True, capture_output=False)
         elapsed = time.perf_counter() - t0
-        logger.info(f"✓ FASE 2 completada en {elapsed:.2f}s (exit code {result.returncode})")
+        logger.info(
+            "OK FASE 2 completada en %.2fs (exit code %s)",
+            elapsed,
+            result.returncode,
+        )
         return True
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"✗ MPI falló con código {e.returncode}")
+    except subprocess.CalledProcessError as exc:
+        logger.error("MPI fallo con codigo %s", exc.returncode)
         return False
     except FileNotFoundError:
         logger.error(
-            "✗ 'mpiexec' no encontrado. "
-            "Instala MPI: sudo apt install libopenmpi-dev  |  brew install open-mpi"
+            "'mpiexec' no fue encontrado. En Windows instala Microsoft MPI; "
+            "en Linux instala OpenMPI o MPICH."
         )
         return False
 
 
-def main():
+def fase_3_cuda() -> str:
+    """
+    Fase 3: procesamiento matricial con CUDA/CuPy.
+
+    Toma el reporte generado por MPI, arma una matriz numerica con las metricas
+    por rank y ejecuta normalizacion, correlacion y un kernel de criticidad
+    relativa. Si CUDA no esta disponible, usa fallback CPU documentado.
+    """
+    logger.info("> FASE 3: Iniciando analisis CUDA...")
+    t0 = time.perf_counter()
+
+    reporte_cuda = run_cuda_analysis()
+
+    elapsed = time.perf_counter() - t0
+    logger.info("OK FASE 3 completada en %.2fs", elapsed)
+    return reporte_cuda
+
+
+def fase_4_html() -> str:
+    """
+    Fase 4: generacion del reporte HTML final.
+
+    Une las salidas de MPI y CUDA en una pagina autocontenida lista para abrir
+    en el navegador y usar como evidencia del proyecto.
+    """
+    logger.info("> FASE 4: Generando reporte HTML...")
+    t0 = time.perf_counter()
+
+    reporte_html = generate_html_report()
+
+    elapsed = time.perf_counter() - t0
+    logger.info("OK FASE 4 completada en %.2fs", elapsed)
+    return reporte_html
+
+
+def main() -> None:
     """
     Punto de entrada principal del pipeline.
 
-    Argumentos de línea de comandos opcionales:
+    Uso:
         python main.py [n_procesos]
-        Ejemplo: python main.py 8   → usa 8 procesos MPI
+        py main.py [n_procesos]
     """
-    print("\n" + "═" * 60)
-    print("  PIPELINE: ANÁLISIS DE TRÁFICO AÉREO Y SENSORES AMBIENTALES")
-    print("═" * 60)
+    print("\n" + "=" * 60, flush=True)
+    print("  PIPELINE: ANALISIS AMBIENTAL PARALELO Y DISTRIBUIDO", flush=True)
+    print("=" * 60, flush=True)
 
-    # Número de procesos MPI (por defecto 4; se puede sobreescribir por CLI)
     n_procesos = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 
-    #Asyncio
     try:
-        datos = fase_1_fetch()
-    except Exception as e:
-        logger.error(f"FASE 1 falló: {e}")
+        fase_1_fetch()
+    except Exception as exc:
+        logger.error("FASE 1 fallo: %s", exc)
         sys.exit(1)
 
-    #FASE 2: MPI
-    exito = fase_2_mpi(n_procesos)
-    if not exito:
-        logger.error("FASE 2 falló. Revisa los logs.")
+    if not fase_2_mpi(n_procesos):
+        logger.error("FASE 2 fallo. Revisa los logs.")
         sys.exit(1)
 
-    print("\n" + "═" * 60)
-    print("  Pipeline completado. Los archivos de salida están en:")
-    print(f"    Datos crudos     → {config.RAW_DATA_DIR}")
-    print(f"      • thingspeak_*.csv   : series temporales de sensores")
-    print(f"      • weather_*.json     : condiciones meteorologicas")
-    print(f"    Datos procesados → {config.PROCESSED_DIR}")
-    print(f"      • reporte_mpi_*.json : analisis agregado listo para CUDA")
-    print("═" * 60 + "\n")
+    try:
+        fase_3_cuda()
+    except Exception as exc:
+        logger.error("FASE 3 fallo: %s", exc)
+        sys.exit(1)
+
+    try:
+        reporte_html = fase_4_html()
+    except Exception as exc:
+        logger.error("FASE 4 fallo: %s", exc)
+        sys.exit(1)
+
+    print("\n" + "=" * 60, flush=True)
+    print("  Pipeline completado. Archivos de salida:", flush=True)
+    print(f"    Datos crudos      -> {config.RAW_DATA_DIR}")
+    print("      - thingspeak_*.csv   : series temporales de sensores")
+    print("      - weather_*.json     : condiciones meteorologicas")
+    print(f"    Datos procesados  -> {config.PROCESSED_DIR}")
+    print("      - reporte_mpi_*.json : analisis agregado MPI")
+    print("      - reporte_cuda_*.json: analisis matricial CUDA")
+    print(f"    Reporte HTML      -> {reporte_html}")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

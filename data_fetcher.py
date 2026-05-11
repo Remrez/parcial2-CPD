@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pandas as pd
@@ -157,6 +157,13 @@ async def fetch_openweather(client: APIClient) -> Optional[dict]:
     Estos datos se cruzan con los sensores de ThingSpeak para validar lecturas
     y con OpenAQ para enriquecer el análisis ambiental.
     """
+    if not config.OPENWEATHER_API_KEY:
+        logger.warning(
+            "[OpenWeather] Sin API key. Define OPENWEATHER_API_KEY o crea keys.py; "
+            "se omitira esta fuente y el pipeline continuara con ThingSpeak."
+        )
+        return None
+
     url = f"{config.OPENWEATHER_BASE_URL}/weather"
     params = {
         "q":     config.OPENWEATHER_CITY,
@@ -180,7 +187,7 @@ async def fetch_openweather(client: APIClient) -> Optional[dict]:
         "velocidad_viento":   raw.get("wind", {}).get("speed"),
         "direccion_viento":   raw.get("wind", {}).get("deg"),
         "nubosidad":          raw.get("clouds", {}).get("all"),  # %
-        "timestamp":          datetime.utcfromtimestamp(raw.get("dt", 0)),
+        "timestamp":          datetime.fromtimestamp(raw.get("dt", 0), timezone.utc),
     }
     logger.info(
         f"[OpenWeather] Clima obtenido: "
@@ -225,7 +232,7 @@ async def fetch_all_sources() -> dict[str, Any]:
     results = {
         "thingspeak":  df_thingspeak,
         "weather":     weather,
-        "timestamp":   datetime.utcnow().isoformat(),
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
 
     # Guardar datos crudos en CSV/JSON para que MPI los lea desde disco
@@ -238,7 +245,7 @@ async def fetch_all_sources() -> dict[str, Any]:
 
 def _save_raw(data: dict) -> None:
     """Guarda cada fuente en un archivo CSV/JSON dentro de datos_crudos/."""
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     for key, value in data.items():
         if key == "timestamp":

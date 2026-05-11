@@ -1,2 +1,6 @@
 keys.py
 __pycache__/
+datos_crudos/
+datos_procesados/
+reportes/
+pipeline.log
